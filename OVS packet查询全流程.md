@@ -238,3 +238,90 @@ rule_dpif_lookup_from_table
     }
 ```
 
+
+
+
+
+# MegaFlow 删除
+
+主要介绍不适用dpdk的MegaFlow删除方式，dpdk的MegaFlow删除在[pmd](#pmd_thread_main)线程中处理，代码的描述为定期使用flush方法。
+
+MegaFlow流表的删除主要由handler和revalidator两个线程组成
+
+handler线程负责对upcall的消息进行处理（下发），在使用dpdk时该线程一直处于阻塞状态，并被[pmd](#pmd_thread_main)线程进行处理。
+
+revalidator线程用于MegaFlow流表的超时删除，主要有以下情况：
+
+> 1. 对于下发的MegaFlow流表，一段时间未使用则删除
+> 2. 在这一段时间内对应的openFlow流表删除，则下发的MegaFlow流表也需要删除
+> 3. 在一段时间内对应的openFlow流表的action发生改变时，MegaFlow流表对应的action也要改变
+
+
+
+```mermaid
+graph TD
+	START([Start])
+	START --> |init|Construct[construct]
+	Construct --> startThread[udpif_start_threads]
+	startThread --> udpif_upcall_handler[udpif_upcall_handler]
+	udpif_upcall_handler --> process_upcall[process_upcall]
+	process_upcall --> handle_upcall[handle_upcall]
+	startThread --> udpif_revalidator[udpif_revalidator]
+	udpif_revalidator --> revalidator[revalidator]
+	
+	click Construct "#construct"
+	click udpif_upcall_handler "#udpif_upcall_handler"
+	click process_upcall "#process_upcall"
+	click handle_upcall "#handle_upcall"
+	click startThread "#udpif_start_threads"
+	click udpif_revalidator "#udpif_revalidator"
+	click revalidator "#revalidator"
+```
+
+
+
+
+
+# udpif_start_threads
+
+> 创建多个revalidator线程和handler线程
+>
+> 其中revalidator数量为CPU的线程数/4 + 1
+>
+> handler线程数量为CPU线程数- revalidator线程数
+
+
+
+# udpif_upcall_handler
+
+> handler线程负责监听upcall事件，并与datapath(megaFlow)交互，处理upcall报文
+
+
+
+# handle_upcall
+
+> 根绝process_upcall查到的规则，并与当前datapath(MegaFlow)情况共同决定是否下发，主要根据当前megaflow流的个数是否达到了最大值（flow_limit)，如果达到最大值则不下发，否则下发规则，并设置ukey并传给revalidator线程，ukey用于确定当前规则的状态
+
+
+
+# udpif_revalidator
+
+> revalidator线程一般处于阻塞状态，并会不断的获取reval_seq（由handler处理upcall消息时获取），从而激活revalidator线程
+>
+> revalidator线程首先获取datapath(MegaFlow)中的Flow个数
+>
+> 并依据handle_upcall 传入的ukey决定当前的状态，如阻塞，删除等
+>
+> 同时会根据当前flow的状态（延迟处理时间）决定MegaFlow 流表的最大数目，当延时大时减少flow_limit
+
+
+
+# revalidator
+
+> 从datapath(MegaFlow)中获取flow的数量，如果flow超过flow_limit的两倍则删除获取的所有flow
+>
+> **超时时间(max_ide)**，根据当前flow的数量与flow_limit获得，如果flow数量超过flow_limit则超时时间设置为100ms，需要更快的删除规则，否则超时时间默认设置为10s
+>
+> 依次遍历MegaFlow中的所有规则，并根据flow对应的ukey获取相关信息，如果ukey中含有的上一次使用规则时间超过max_ide(超时时间)，则删除当前流，如果MegaFlow中存储的规则的reval_seq与ukey中的reval_seq不符，则说明openFlow流变发生了变化，我们需要根据ukey对MegaFlow流表中的规则进行删除或修改。
+>
+> 
